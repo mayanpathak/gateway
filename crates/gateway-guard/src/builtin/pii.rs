@@ -5,6 +5,8 @@
 //! - Phone numbers (US/international)
 //! - Credit-card-shaped 16-digit groups
 //! - SSN-shaped strings (`XXX-XX-XXXX`)
+//! - IBAN-shaped strings (2-letter country code + 2 check digits + BBAN,
+//!   per ISO 13616; shape-matched only - mod-97 checksum not verified)
 //! - Common API-key shapes (`Bearer <token>`)
 
 use async_trait::async_trait;
@@ -20,6 +22,7 @@ struct PiiPatterns {
     credit_card: Regex,
     ssn: Regex,
     api_key: Regex,
+    iban: Regex,
 }
 
 impl PiiPatterns {
@@ -35,6 +38,13 @@ impl PiiPatterns {
             ssn: Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap(),
             // Generic API key (Bearer token or long alphanum string ≥ 20 chars).
             api_key: Regex::new(r"(?i)bearer\s+[A-Za-z0-9\-._~+/]+=*").unwrap(),
+            // IBAN: 2-letter ISO 3166-1 alpha-2 country code, 2 decimal check
+            // digits, then 11–30 alphanumeric BBAN characters (total 15–34
+            // characters, per ISO 13616).  Matched in canonical upper-case form
+            // without spaces.  The mod-97 checksum is intentionally not
+            // verified — this is a shape match for redaction, consistent with
+            // how every other pattern in this file works.
+            iban: Regex::new(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b").unwrap(),
         }
     }
 }
@@ -70,6 +80,7 @@ impl PiiGuardrail {
         // interfere with each other (credit-card before phone, since CC is 16
         // digits and phone is 10).
         let t = p.credit_card.replace_all(text, "[CREDIT_CARD]");
+        let t = p.iban.replace_all(&t, "[IBAN]");
         let t = p.ssn.replace_all(&t, "[SSN]");
         let t = p.phone.replace_all(&t, "[PHONE]");
         let t = p.email.replace_all(&t, "[EMAIL]");
@@ -85,6 +96,7 @@ impl PiiGuardrail {
             || p.ssn.is_match(text)
             || p.phone.is_match(text)
             || p.api_key.is_match(text)
+            || p.iban.is_match(text)
     }
 }
 
@@ -165,6 +177,52 @@ mod tests {
             }
             other => panic!("expected Mask, got {other:?}"),
         }
+    }
+
+    // Canonical example from the IBAN Wikipedia article / ISO 13616 test vectors.
+    #[tokio::test]
+    async fn masks_iban() {
+        let g = PiiGuardrail::new();
+        let verdict = g.check(&ctx("IBAN: GB82WEST12345698765432")).await;
+        match verdict {
+            GuardVerdict::Mask { redacted_text } => {
+                assert!(
+                    !redacted_text.contains("GB82WEST12345698765432"),
+                    "IBAN should be redacted, got: {redacted_text}"
+                );
+                assert!(redacted_text.contains("[IBAN]"));
+            }
+            other => panic!("expected Mask, got {other:?}"),
+        }
+    }
+
+    // A German IBAN to verify the pattern isn't GB-specific.
+    #[tokio::test]
+    async fn masks_german_iban() {
+        let g = PiiGuardrail::new();
+        let verdict = g
+            .check(&ctx("Please transfer to DE89370400440532013000"))
+            .await;
+        match verdict {
+            GuardVerdict::Mask { redacted_text } => {
+                assert!(!redacted_text.contains("DE89370400440532013000"));
+                assert!(redacted_text.contains("[IBAN]"));
+            }
+            other => panic!("expected Mask, got {other:?}"),
+        }
+    }
+
+    // Negative test: a short uppercase string below the IBAN minimum BBAN
+    // length (11 chars) must not be flagged.
+    #[tokio::test]
+    async fn does_not_flag_short_uppercase_string() {
+        let g = PiiGuardrail::new();
+        let verdict = g.check(&ctx("Reference code: GB82ABCD")).await;
+        assert_eq!(
+            verdict,
+            GuardVerdict::Allow,
+            "short uppercase string below IBAN minimum length should not be flagged"
+        );
     }
 
     #[tokio::test]
