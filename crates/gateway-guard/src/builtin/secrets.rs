@@ -1,11 +1,12 @@
 //! Secrets-detection guardrail.
 //!
-//! Blocks requests that contain recognisable provider API key patterns:
+//! Blocks requests that contain recognisable secret or token patterns:
 //! - `sk-...` — OpenAI API keys
 //! - `AKIA...` — AWS access key IDs
 //! - `ghp_...` — GitHub personal access tokens
 //! - `xoxb-` / `xoxp-` — Slack bot / user tokens
 //! - `glpat-` — GitLab personal access tokens
+//! - `hf_...` — Hugging Face access tokens
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -65,6 +66,11 @@ impl SecretsGuardrail {
             SecretPatternWrap(SecretPattern {
                 label: "GitLab personal access token",
                 re: Regex::new(r"glpat-[A-Za-z0-9_\-]{20,}").unwrap(),
+            }),
+            SecretPatternWrap(SecretPattern {
+                label: "Hugging Face access token",
+                // Matches common Hugging Face access token formats observed in the wild.
+                re: Regex::new(r"hf_[A-Za-z0-9]{34,40}").unwrap(),
             }),
         ];
         Self { patterns }
@@ -154,6 +160,54 @@ mod tests {
             matches!(verdict, GuardVerdict::Block { .. }),
             "expected Block for GitLab PAT"
         );
+    }
+
+    #[tokio::test]
+    async fn blocks_huggingface_token_34_chars() {
+        let g = SecretsGuardrail::new();
+        let token = format!("hf_{}", "a".repeat(34));
+        let verdict = g.check(&ctx(&format!("HF_TOKEN={token}"))).await;
+        assert!(
+            matches!(verdict, GuardVerdict::Block { .. }),
+            "expected Block for Hugging Face token (34 chars), got {verdict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocks_huggingface_token_40_chars() {
+        let g = SecretsGuardrail::new();
+        let token = format!("hf_{}", "b".repeat(40));
+        let verdict = g.check(&ctx(&format!("HF_TOKEN={token}"))).await;
+        assert!(
+            matches!(verdict, GuardVerdict::Block { .. }),
+            "expected Block for Hugging Face token (40 chars), got {verdict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_huggingface_token_too_short() {
+        let g = SecretsGuardrail::new();
+        // 10 chars after hf_ — well below the minimum, should not be flagged.
+        let verdict = g.check(&ctx("hf_abc1234567")).await;
+        assert_eq!(
+            verdict,
+            GuardVerdict::Allow,
+            "short hf_ string should not be flagged"
+        );
+    }
+
+    #[tokio::test]
+    async fn huggingface_token_has_correct_label() {
+        let g = SecretsGuardrail::new();
+        let token = format!("hf_{}", "a".repeat(34));
+        let verdict = g.check(&ctx(&token)).await;
+
+        match verdict {
+            GuardVerdict::Block { reason } => {
+                assert!(reason.contains("Hugging Face"), "got reason: {reason}");
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
     }
 
     #[tokio::test]
