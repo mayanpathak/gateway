@@ -39,7 +39,8 @@ struct WebhookResponse {
 #[derive(Debug, Deserialize)]
 struct ResultEntry {
     flagged: bool,
-    // serde_json preserves insertion order in Maps, so "first truthy" is stable.
+    // preserve_order feature ensures insertion order is kept, so "first truthy"
+    // means first as the webhook returned it in the JSON — not alphabetical order.
     #[serde(default)]
     categories: serde_json::Map<String, serde_json::Value>,
 }
@@ -242,6 +243,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_reason_is_first_in_json_order_not_alphabetical() {
+        // "toxicity" is listed first in the JSON but "jailbreak" sorts first
+        // alphabetically (j < t). With preserve_order we get "toxicity" —
+        // without it we'd get "jailbreak". This test fails without the
+        // preserve_order feature on serde_json.
+        let (verdict, _server) = run_with_body(serde_json::json!({
+            "results": [{ "flagged": true, "categories": { "toxicity": true, "jailbreak": true } }]
+        }))
+        .await;
+
+        match verdict {
+            GuardVerdict::Block { reason } => assert_eq!(reason, "toxicity"),
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn block_reason_falls_back_when_no_categories() {
         let (verdict, _server) = run_with_body(serde_json::json!({
             "results": [{ "flagged": true, "categories": {} }]
@@ -330,5 +348,11 @@ mod tests {
     fn name_is_set() {
         let g = WebhookGuardrail::new("my-hook", "http://localhost:9090/check");
         assert_eq!(g.name(), "my-hook");
+    }
+    #[test]
+    fn stub_always_allows() {
+        // Baseline: construction succeeds and name is set correctly.
+        let g = WebhookGuardrail::new("lakera", "https://api.lakera.ai/v1/prompt_injection");
+        assert_eq!(g.name(), "lakera");
     }
 }

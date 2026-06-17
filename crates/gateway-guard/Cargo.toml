@@ -12,7 +12,7 @@ authors.workspace = true
 gateway-spine = { path = "../gateway-spine" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 regex = "1"
 async-trait = "0.1"
 thiserror = "2"
