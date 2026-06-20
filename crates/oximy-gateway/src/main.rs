@@ -63,7 +63,7 @@ fn run_up(args: UpArgs) -> anyhow::Result<()> {
 async fn run_up_async(args: UpArgs) -> anyhow::Result<()> {
     use gateway_cache::build_registry_from_models_dev;
     use gateway_control::cache_handle::memory_cache_handle;
-    use gateway_control::guard::default_chain;
+    // 8A: removed `use gateway_control::guard::default_chain;`
     use gateway_control::keystore::{MutableKeyStore, PersistHook};
     use gateway_control::providers::{Deployment, ProviderRegistry};
     use gateway_control::state::AppState;
@@ -349,11 +349,12 @@ async fn run_up_async(args: UpArgs) -> anyhow::Result<()> {
     );
 
     // ── 6a. Build AppState (with L1 cache pre-wired) ─────────────────────────
+    // 8B: build guard chain from config before constructing AppState
     let mut state_inner = AppState::with_parts_and_telemetry(
         ks,
         Arc::new(SystemClock),
         providers,
-        Arc::new(default_chain()),
+        Arc::new(build_guard_chain_from_config(config.as_ref())),
         Arc::new(MemoryAudit::new()),
         telem_sink,
         metrics,
@@ -561,10 +562,19 @@ fn load_or_seed_config(config_path: &std::path::Path) -> anyhow::Result<Option<F
         Ok(Some(cfg))
     } else {
         // Write an example config so the operator knows what's possible.
+        // 8F: updated example JSON to show guardrails
         let example = r#"{
-  "_comment": "Oximy Gateway config — edit and restart to apply. All fields are optional.",
+  "_comment": "Oximy Gateway config - edit and restart to apply. All fields are optional.",
   "routes": {},
-  "model_overrides": []
+  "model_overrides": [],
+  "guardrails": [{
+    "id": "global",
+    "apply_to": ["*"],
+    "rules": [
+      { "type": "secrets", "mode": "enforce" },
+      { "type": "pii", "mode": "enforce" }
+    ]
+  }]
 }
 "#;
         if let Err(e) = std::fs::write(config_path, example) {
@@ -578,12 +588,45 @@ fn load_or_seed_config(config_path: &std::path::Path) -> anyhow::Result<Option<F
 
 /// Minimal config file schema — only what we act on here. Other fields (providers,
 /// keys) are ignored; they are managed by env vars / the `keys` CLI.
+// 8C: extended FileConfig with guardrails field and new structs
 #[derive(serde::Deserialize, Default)]
 struct FileConfig {
     #[serde(default)]
     routes: std::collections::HashMap<String, FileRoute>,
     #[serde(default)]
     model_overrides: Vec<serde_json::Value>,
+    #[serde(default)]
+    guardrails: Vec<FileGuardrailPolicy>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct FileGuardrailPolicy {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    apply_to: Vec<String>,
+    #[serde(default)]
+    rules: Vec<FileGuardrailRule>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct FileGuardrailRule {
+    #[serde(rename = "type", default)]
+    guardrail_type: String,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    keywords: Vec<String>,
+    #[serde(default)]
+    pattern: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    schema: Option<serde_json::Value>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    stages: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -603,12 +646,109 @@ struct FileRouteTarget {
     model: String,
 }
 
+// 8D: build guard chain from config file, falling back to the built-in default chain
+fn build_guard_chain_from_config(config: Option<&FileConfig>) -> gateway_guard::GuardChain {
+    use gateway_guard::builder_from_config::{GuardrailRuleView, chain_from_rules, default_chain};
+
+    let cfg = match config {
+        Some(c) if !c.guardrails.is_empty() => c,
+        _ => {
+            tracing::debug!("no guardrails config present; using built-in default chain");
+            return default_chain();
+        }
+    };
+
+    let key_scoped_count = cfg
+        .guardrails
+        .iter()
+        .filter(|g| !g.apply_to.is_empty() && !g.apply_to.iter().any(|t| t == "*"))
+        .count();
+    if key_scoped_count > 0 {
+        tracing::warn!(
+            count = key_scoped_count,
+            "oximy-gateway.json contains key-scoped guardrail policies, but per-key \
+             routing is not yet implemented; these policies will be skipped"
+        );
+    }
+
+    let policy = match cfg
+        .guardrails
+        .iter()
+        .find(|g| g.apply_to.is_empty() || g.apply_to.iter().any(|t| t == "*"))
+    {
+        Some(p) => p,
+        None => {
+            tracing::info!("guardrails config has no global policy; using built-in default chain");
+            return default_chain();
+        }
+    };
+
+    let staged_count = policy.rules.iter().filter(|r| !r.stages.is_empty()).count();
+    if staged_count > 0 {
+        tracing::warn!(
+            policy_id = %policy.id,
+            count = staged_count,
+            "guardrail rules configure stages, but per-stage routing is not yet \
+             implemented; configured rules will run wherever the installed chain runs"
+        );
+    }
+
+    if policy.rules.is_empty() {
+        tracing::info!(
+            policy_id = %policy.id,
+            "global guardrail policy has no rules; using built-in default chain"
+        );
+        return default_chain();
+    }
+
+    let views: Vec<GuardrailRuleView<'_>> = policy
+        .rules
+        .iter()
+        .map(|r| GuardrailRuleView {
+            guardrail_type: &r.guardrail_type,
+            mode: if r.mode.is_empty() {
+                "enforce"
+            } else {
+                &r.mode
+            },
+            keywords: &r.keywords,
+            pattern: r.pattern.as_deref(),
+            label: r.label.as_deref(),
+            schema: r.schema.as_ref(),
+            url: r.url.as_deref(),
+            stages: &r.stages,
+        })
+        .collect();
+
+    match chain_from_rules(&views) {
+        Ok(chain) => {
+            tracing::info!(
+                policy_id = %policy.id,
+                rule_count = policy.rules.len(),
+                "guard chain built from oximy-gateway.json"
+            );
+            chain
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                policy_id = %policy.id,
+                "failed to build guard chain from config; using built-in default chain"
+            );
+            default_chain()
+        }
+    }
+}
+
 /// Apply config-file routes and model overrides to an already-built AppState.
 fn apply_config<C: gateway_spine::Clock + 'static>(
     cfg: &FileConfig,
     state: &gateway_control::state::AppState<C>,
 ) {
     use gateway_cache::build_registry_from_models_dev;
+    // 8E: guardrails are installed before AppState construction by
+    // build_guard_chain_from_config(). Hot reload requires a future swappable
+    // guard-chain holder and is intentionally out of scope for this PR.
 
     for (model_id, file_route) in &cfg.routes {
         // Skip comment keys (keys starting with "_")

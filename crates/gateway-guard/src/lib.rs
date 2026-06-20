@@ -36,6 +36,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::collapsible_if)]
 
+pub mod builder_from_config;
 pub mod builtin;
 pub mod chain;
 pub mod guardrail;
@@ -43,6 +44,7 @@ pub mod types;
 pub mod webhook;
 
 // Re-export the most commonly used items at crate root.
+pub use builder_from_config::{GuardrailRuleView, chain_from_rules, default_chain};
 pub use chain::{ChainVerdict, GuardChain, GuardEntry};
 pub use guardrail::Guardrail;
 pub use types::{EnforcementMode, GuardContext, GuardError, GuardStage, GuardVerdict};

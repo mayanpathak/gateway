@@ -877,6 +877,47 @@ mod tests {
         state
     }
 
+    /// Build an AppState wired to a shared MockProvider and a guard chain
+    /// assembled from the given config-style rule views.
+    async fn state_with_rules(
+        provider: Arc<MockProvider>,
+        budget: Option<Usd>,
+        rules: &[gateway_guard::builder_from_config::GuardrailRuleView<'_>],
+    ) -> AppState<MockClock> {
+        let chain = gateway_guard::builder_from_config::chain_from_rules(rules).unwrap();
+        let mut ks = StaticKeyStore::new();
+        ks.insert(key(budget, None, RateLimits::default()));
+        let providers = ProviderRegistry::new();
+        providers.insert(
+            "openai",
+            Deployment {
+                provider: provider.clone(),
+                credentials: Arc::new(Credentials::new("sk-up")),
+            },
+        );
+        let store = Arc::new(
+            gateway_store::Store::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        store
+            .upsert_key(&make_stored_key("key_1", budget))
+            .await
+            .unwrap();
+
+        let state = AppState::with_parts(
+            Arc::new(ks),
+            Arc::new(MockClock::new(1_000)),
+            providers,
+            Arc::new(chain),
+            Arc::new(MemoryAudit::new()),
+            store,
+        );
+        state.registry.write().unwrap().insert(gpt4o());
+        state.ledger.set_budget("key_1", budget, Usd::ZERO);
+        state
+    }
+
     fn chat_req() -> ChatRequest {
         ChatRequest::new("gpt-4o", vec![Message::text(Role::User, "hi there")])
     }
@@ -1532,5 +1573,133 @@ mod tests {
         assert!(!done.fallback_fired);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert_eq!(done.cost, Usd::from_micros(7_500));
+    }
+
+    // ── Config-chain guard integration ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn config_keyword_chain_blocks_matching_prompt() {
+        let kws = vec!["forbidden-word".to_string()];
+        let rules = [gateway_guard::builder_from_config::GuardrailRuleView {
+            guardrail_type: "keyword",
+            mode: "enforce",
+            keywords: &kws,
+            pattern: None,
+            label: None,
+            schema: None,
+            url: None,
+            stages: &[],
+        }];
+        let provider = Arc::new(MockProvider::new(TokenUsage::default()));
+        let state =
+            state_with_rules(provider.clone(), Some(Usd::from_dollars_f64(1.0)), &rules).await;
+        let k = key(
+            Some(Usd::from_dollars_f64(1.0)),
+            None,
+            RateLimits::default(),
+        );
+        let req = ChatRequest::new(
+            "gpt-4o",
+            vec![Message::text(
+                Role::User,
+                "please share the forbidden-word plan",
+            )],
+        );
+
+        let err = Gateway::run(&state, &k, &req).await.unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN);
+        assert!(matches!(err, GatewayError::GuardBlocked(_)));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.ledger.reserved("key_1"), Usd::ZERO);
+    }
+
+    #[tokio::test]
+    async fn config_observe_only_does_not_block_request() {
+        let kws = vec!["forbidden-word".to_string()];
+        let rules = [gateway_guard::builder_from_config::GuardrailRuleView {
+            guardrail_type: "keyword",
+            mode: "observe_only",
+            keywords: &kws,
+            pattern: None,
+            label: None,
+            schema: None,
+            url: None,
+            stages: &[],
+        }];
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            ..Default::default()
+        };
+        let provider = Arc::new(MockProvider::new(usage));
+        let state =
+            state_with_rules(provider.clone(), Some(Usd::from_dollars_f64(1.0)), &rules).await;
+        let k = key(
+            Some(Usd::from_dollars_f64(1.0)),
+            None,
+            RateLimits::default(),
+        );
+        let req = ChatRequest::new(
+            "gpt-4o",
+            vec![Message::text(
+                Role::User,
+                "the forbidden-word should pass through in observe_only",
+            )],
+        );
+
+        Gateway::run(&state, &k, &req).await.unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn config_regex_deny_blocks_pattern_match() {
+        let pat = r"\bpassword\b".to_string();
+        let rules = [gateway_guard::builder_from_config::GuardrailRuleView {
+            guardrail_type: "regex_deny",
+            mode: "enforce",
+            keywords: &[],
+            pattern: Some(&pat),
+            label: Some("password"),
+            schema: None,
+            url: None,
+            stages: &[],
+        }];
+        let provider = Arc::new(MockProvider::new(TokenUsage::default()));
+        let state =
+            state_with_rules(provider.clone(), Some(Usd::from_dollars_f64(1.0)), &rules).await;
+        let k = key(
+            Some(Usd::from_dollars_f64(1.0)),
+            None,
+            RateLimits::default(),
+        );
+        let req = ChatRequest::new(
+            "gpt-4o",
+            vec![Message::text(Role::User, "reset my password now")],
+        );
+
+        let err = Gateway::run(&state, &k, &req).await.unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_config_chain_allows_clean_request() {
+        let rules: &[gateway_guard::builder_from_config::GuardrailRuleView<'_>] = &[];
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            ..Default::default()
+        };
+        let provider = Arc::new(MockProvider::new(usage));
+        let state =
+            state_with_rules(provider.clone(), Some(Usd::from_dollars_f64(1.0)), rules).await;
+        let k = key(
+            Some(Usd::from_dollars_f64(1.0)),
+            None,
+            RateLimits::default(),
+        );
+
+        Gateway::run(&state, &k, &chat_req()).await.unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 }

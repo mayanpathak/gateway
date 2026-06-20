@@ -20,6 +20,8 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
 gateway-spine = { path = "../gateway-spine" }
+regex = "1"
+
 
 [dev-dependencies]
 tempfile = "3"

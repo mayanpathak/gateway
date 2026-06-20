@@ -48,7 +48,8 @@ pub use error::ConfigError;
 pub use interpolate::{interpolate, map_lookup};
 pub use load::{load, validate, validate_semantics};
 pub use model::{
-    Config, GuardrailAttachment, KeyConfig, ProviderConfig, RegistryOverride, RouteConfig,
+    Config, GuardrailConfig, GuardrailMode, GuardrailRuleConfig, GuardrailStage, GuardrailType,
+    KeyConfig, ProviderConfig, RegistryOverride, RouteConfig,
 };
 pub use schema::{config_schema, validate_structure};
 pub use store::{ConfigStore, MemConfigStore, SqliteConfigStore, StoredKey, StoredProvider};

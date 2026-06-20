@@ -38,7 +38,10 @@ pub fn config_schema() -> Value {
                         "rpm": { "type": "integer", "minimum": 0 },
                         "tpm": { "type": "integer", "minimum": 0 },
                         "max_parallel": { "type": "integer", "minimum": 0 },
-                        "model_allowlist": { "type": "array", "items": { "type": "string" } }
+                        "model_allowlist": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
                     }
                 }
             },
@@ -53,6 +56,73 @@ pub fn config_schema() -> Value {
                         "provider": { "type": "string", "minLength": 1 }
                     }
                 }
+            },
+            "guardrails": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": { "type": "string", "minLength": 1 },
+                        "apply_to": {
+                            "type": "array",
+                            "items": { "type": "string", "minLength": 1 }
+                        },
+                        "rules": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["type"],
+                                "properties": {
+                                    "type": {
+                                        "type": "string",
+                                        "enum": [
+                                            "secrets",
+                                            "pii",
+                                            "keyword",
+                                            "regex_deny",
+                                            "json_schema",
+                                            "webhook"
+                                        ]
+                                    },
+                                    "mode": {
+                                        "type": "string",
+                                        "enum": [
+                                            "enforce",
+                                            "observe_only",
+                                            "dry_run"
+                                        ]
+                                    },
+                                    "stages": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "string",
+                                            "enum": [
+                                                "pre_request",
+                                                "post_response",
+                                                "pre_tool_call",
+                                                "post_tool_result"
+                                            ]
+                                        }
+                                    },
+                                    "keywords": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "string",
+                                            "minLength": 1
+                                        }
+                                    },
+                                    "pattern": { "type": "string" },
+                                    "label": { "type": "string" },
+                                    "schema": { "type": "object" },
+                                    "url": { "type": "string", "minLength": 1 }
+                                },
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "additionalProperties": false
+                }
             }
         }
     })
@@ -64,11 +134,13 @@ pub fn validate_structure(value: &Value) -> Result<(), ConfigError> {
     let compiled = jsonschema::validator_for(&schema).map_err(|e| ConfigError::Validation {
         detail: format!("schema compile: {e}"),
     })?;
+
     if let Some(err) = compiled.iter_errors(value).next() {
         return Err(ConfigError::Validation {
             detail: err.to_string(),
         });
     }
+
     Ok(())
 }
 
@@ -83,12 +155,16 @@ mod tests {
             "providers": [{ "id": "openai", "kind": "openai" }],
             "keys": [{ "id": "k1", "max_budget_usd": 10.0 }]
         });
+
         validate_structure(&v).unwrap();
     }
 
     #[test]
     fn provider_missing_id_fails() {
-        let v = json!({ "providers": [{ "kind": "openai" }] });
+        let v = json!({
+            "providers": [{ "kind": "openai" }]
+        });
+
         assert!(matches!(
             validate_structure(&v),
             Err(ConfigError::Validation { .. })
@@ -97,7 +173,46 @@ mod tests {
 
     #[test]
     fn negative_budget_fails() {
-        let v = json!({ "keys": [{ "id": "k1", "max_budget_usd": -5.0 }] });
+        let v = json!({
+            "keys": [{ "id": "k1", "max_budget_usd": -5.0 }]
+        });
+
+        assert!(matches!(
+            validate_structure(&v),
+            Err(ConfigError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn guardrails_schema_accepts_valid_policy() {
+        let v = json!({
+            "guardrails": [{
+                "id": "global",
+                "apply_to": ["*"],
+                "rules": [{
+                    "type": "regex_deny",
+                    "mode": "enforce",
+                    "stages": ["pre_request"],
+                    "pattern": "\\bpassword\\b",
+                    "label": "password"
+                }]
+            }]
+        });
+
+        validate_structure(&v).unwrap();
+    }
+
+    #[test]
+    fn guardrails_schema_rejects_unknown_type() {
+        let v = json!({
+            "guardrails": [{
+                "id": "global",
+                "rules": [{
+                    "type": "not_real"
+                }]
+            }]
+        });
+
         assert!(matches!(
             validate_structure(&v),
             Err(ConfigError::Validation { .. })

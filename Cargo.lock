@@ -988,6 +988,7 @@ dependencies = [
  "gateway-spine",
  "jsonschema",
  "notify",
+ "regex",
  "serde",
  "serde_json",
  "sqlx",
