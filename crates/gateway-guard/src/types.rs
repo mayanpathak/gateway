@@ -78,6 +78,8 @@ pub enum GuardError {
     RegexCompile(String),
     #[error("JSON schema validation error: {0}")]
     SchemaValidation(String),
+    #[error("invalid guardrail config: {0}")]
+    InvalidConfig(String),
 }
 
 #[cfg(test)]

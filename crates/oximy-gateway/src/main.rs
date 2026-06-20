@@ -96,7 +96,8 @@ async fn run_up_async(args: UpArgs) -> anyhow::Result<()> {
 
     // ── 2b. Config file (light) ───────────────────────────────────────────────
     let config_path = data_dir.join("oximy-gateway.json");
-    let config = load_or_seed_config(&config_path)?;
+    let config_keys = sf.load_keys();
+    let config = load_or_seed_config(&config_path, &config_keys)?;
 
     // ── 3. Build the mutable, live key store with a file-persistence hook ─────
     // The hook is called after every `insert` / `revoke` to write the state file.
@@ -354,7 +355,7 @@ async fn run_up_async(args: UpArgs) -> anyhow::Result<()> {
         ks,
         Arc::new(SystemClock),
         providers,
-        Arc::new(build_guard_chain_from_config(config.as_ref())),
+        Arc::new(build_guard_chain_from_config(config.as_ref())?),
         Arc::new(MemoryAudit::new()),
         telem_sink,
         metrics,
@@ -551,18 +552,26 @@ fn register_compat_provider(
 
 /// Light config file: load `oximy-gateway.json` from the data dir. On first boot
 /// (no file exists) write a commented example. Config is additive — env still wins
-/// for provider keys; config can add routes/model overrides.
-fn load_or_seed_config(config_path: &std::path::Path) -> anyhow::Result<Option<FileConfig>> {
+/// for provider keys; config can add routes/model overrides/guardrails.
+fn load_or_seed_config(
+    config_path: &std::path::Path,
+    keys: &[gateway_spine::VirtualKey],
+) -> anyhow::Result<Option<FileConfig>> {
     if config_path.exists() {
         let text = std::fs::read_to_string(config_path)
             .map_err(|e| anyhow::anyhow!("reading config {}: {e}", config_path.display()))?;
-        let cfg: FileConfig = serde_json::from_str(&text)
+
+        let raw_value: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| anyhow::anyhow!("parsing config {}: {e}", config_path.display()))?;
+
+        validate_config_guardrails(config_path, &raw_value, keys)?;
+
+        let cfg: FileConfig = serde_json::from_value(raw_value)
+            .map_err(|e| anyhow::anyhow!("parsing config {}: {e}", config_path.display()))?;
+
         tracing::info!(path = %config_path.display(), "config file loaded");
         Ok(Some(cfg))
     } else {
-        // Write an example config so the operator knows what's possible.
-        // 8F: updated example JSON to show guardrails
         let example = r#"{
   "_comment": "Oximy Gateway config - edit and restart to apply. All fields are optional.",
   "routes": {},
@@ -586,9 +595,40 @@ fn load_or_seed_config(config_path: &std::path::Path) -> anyhow::Result<Option<F
     }
 }
 
+fn validate_config_guardrails(
+    config_path: &std::path::Path,
+    raw_config: &serde_json::Value,
+    keys: &[gateway_spine::VirtualKey],
+) -> anyhow::Result<()> {
+    let guardrails = raw_config
+        .get("guardrails")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+
+    let keys = keys
+        .iter()
+        .map(|key| serde_json::json!({ "id": key.id }))
+        .collect::<Vec<_>>();
+
+    let validation_doc = serde_json::json!({
+        "version": 1,
+        "keys": keys,
+        "guardrails": guardrails,
+    });
+
+    let validation_raw = serde_json::to_string(&validation_doc)?;
+    gateway_config::validate(&validation_raw).map_err(|e| {
+        anyhow::anyhow!(
+            "invalid guardrails config in {}: {e}",
+            config_path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
 /// Minimal config file schema — only what we act on here. Other fields (providers,
 /// keys) are ignored; they are managed by env vars / the `keys` CLI.
-// 8C: extended FileConfig with guardrails field and new structs
 #[derive(serde::Deserialize, Default)]
 struct FileConfig {
     #[serde(default)]
@@ -596,37 +636,7 @@ struct FileConfig {
     #[serde(default)]
     model_overrides: Vec<serde_json::Value>,
     #[serde(default)]
-    guardrails: Vec<FileGuardrailPolicy>,
-}
-
-#[derive(serde::Deserialize, Default)]
-struct FileGuardrailPolicy {
-    #[serde(default)]
-    id: String,
-    #[serde(default)]
-    apply_to: Vec<String>,
-    #[serde(default)]
-    rules: Vec<FileGuardrailRule>,
-}
-
-#[derive(serde::Deserialize, Default)]
-struct FileGuardrailRule {
-    #[serde(rename = "type", default)]
-    guardrail_type: String,
-    #[serde(default)]
-    mode: String,
-    #[serde(default)]
-    keywords: Vec<String>,
-    #[serde(default)]
-    pattern: Option<String>,
-    #[serde(default)]
-    label: Option<String>,
-    #[serde(default)]
-    schema: Option<serde_json::Value>,
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    stages: Vec<String>,
+    guardrails: Vec<gateway_config::GuardrailConfig>,
 }
 
 #[derive(serde::Deserialize)]
@@ -646,15 +656,16 @@ struct FileRouteTarget {
     model: String,
 }
 
-// 8D: build guard chain from config file, falling back to the built-in default chain
-fn build_guard_chain_from_config(config: Option<&FileConfig>) -> gateway_guard::GuardChain {
+fn build_guard_chain_from_config(
+    config: Option<&FileConfig>,
+) -> anyhow::Result<gateway_guard::GuardChain> {
     use gateway_guard::builder_from_config::{GuardrailRuleView, chain_from_rules, default_chain};
 
     let cfg = match config {
         Some(c) if !c.guardrails.is_empty() => c,
         _ => {
             tracing::debug!("no guardrails config present; using built-in default chain");
-            return default_chain();
+            return Ok(default_chain());
         }
     };
 
@@ -663,6 +674,7 @@ fn build_guard_chain_from_config(config: Option<&FileConfig>) -> gateway_guard::
         .iter()
         .filter(|g| !g.apply_to.is_empty() && !g.apply_to.iter().any(|t| t == "*"))
         .count();
+
     if key_scoped_count > 0 {
         tracing::warn!(
             count = key_scoped_count,
@@ -679,7 +691,7 @@ fn build_guard_chain_from_config(config: Option<&FileConfig>) -> gateway_guard::
         Some(p) => p,
         None => {
             tracing::info!("guardrails config has no global policy; using built-in default chain");
-            return default_chain();
+            return Ok(default_chain());
         }
     };
 
@@ -698,45 +710,69 @@ fn build_guard_chain_from_config(config: Option<&FileConfig>) -> gateway_guard::
             policy_id = %policy.id,
             "global guardrail policy has no rules; using built-in default chain"
         );
-        return default_chain();
+        return Ok(default_chain());
     }
 
-    let views: Vec<GuardrailRuleView<'_>> = policy
+    let stage_strings = policy
         .rules
         .iter()
-        .map(|r| GuardrailRuleView {
-            guardrail_type: &r.guardrail_type,
-            mode: if r.mode.is_empty() {
-                "enforce"
-            } else {
-                &r.mode
-            },
-            keywords: &r.keywords,
-            pattern: r.pattern.as_deref(),
-            label: r.label.as_deref(),
-            schema: r.schema.as_ref(),
-            url: r.url.as_deref(),
-            stages: &r.stages,
+        .map(|rule| {
+            rule.stages
+                .iter()
+                .map(|stage| guardrail_stage_as_str(*stage).to_string())
+                .collect::<Vec<_>>()
         })
-        .collect();
+        .collect::<Vec<_>>();
 
-    match chain_from_rules(&views) {
-        Ok(chain) => {
-            tracing::info!(
-                policy_id = %policy.id,
-                rule_count = policy.rules.len(),
-                "guard chain built from oximy-gateway.json"
-            );
-            chain
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                policy_id = %policy.id,
-                "failed to build guard chain from config; using built-in default chain"
-            );
-            default_chain()
-        }
+    let views = policy
+        .rules
+        .iter()
+        .zip(stage_strings.iter())
+        .map(|(rule, stages)| GuardrailRuleView {
+            guardrail_type: guardrail_type_as_str(rule.guardrail_type),
+            mode: guardrail_mode_as_str(rule.mode),
+            keywords: &rule.keywords,
+            pattern: rule.pattern.as_deref(),
+            label: rule.label.as_deref(),
+            schema: rule.schema.as_ref(),
+            url: rule.url.as_deref(),
+            stages,
+        })
+        .collect::<Vec<_>>();
+
+    chain_from_rules(&views).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to build guard chain from config policy '{}': {e}",
+            policy.id
+        )
+    })
+}
+
+fn guardrail_type_as_str(t: gateway_config::GuardrailType) -> &'static str {
+    match t {
+        gateway_config::GuardrailType::Secrets => "secrets",
+        gateway_config::GuardrailType::Pii => "pii",
+        gateway_config::GuardrailType::Keyword => "keyword",
+        gateway_config::GuardrailType::RegexDeny => "regex_deny",
+        gateway_config::GuardrailType::JsonSchema => "json_schema",
+        gateway_config::GuardrailType::Webhook => "webhook",
+    }
+}
+
+fn guardrail_mode_as_str(mode: gateway_config::GuardrailMode) -> &'static str {
+    match mode {
+        gateway_config::GuardrailMode::Enforce => "enforce",
+        gateway_config::GuardrailMode::ObserveOnly => "observe_only",
+        gateway_config::GuardrailMode::DryRun => "dry_run",
+    }
+}
+
+fn guardrail_stage_as_str(stage: gateway_config::GuardrailStage) -> &'static str {
+    match stage {
+        gateway_config::GuardrailStage::PreRequest => "pre_request",
+        gateway_config::GuardrailStage::PostResponse => "post_response",
+        gateway_config::GuardrailStage::PreToolCall => "pre_tool_call",
+        gateway_config::GuardrailStage::PostToolResult => "post_tool_result",
     }
 }
 

@@ -33,6 +33,7 @@ pub fn chain_from_rules(rules: &[GuardrailRuleView<'_>]) -> Result<GuardChain, G
 
     for rule in rules {
         let mode = parse_mode(rule.mode);
+
         match rule.guardrail_type {
             "secrets" => {
                 chain = chain.push(mode, Arc::new(SecretsGuardrail::new()));
@@ -42,10 +43,11 @@ pub fn chain_from_rules(rules: &[GuardrailRuleView<'_>]) -> Result<GuardChain, G
             }
             "keyword" => {
                 if rule.keywords.is_empty() {
-                    return Err(GuardError::RegexCompile(
+                    return Err(GuardError::InvalidConfig(
                         "keyword guardrail requires at least one keyword".into(),
                     ));
                 }
+
                 chain = chain.push(
                     mode,
                     Arc::new(KeywordBanlistGuardrail::new(
@@ -59,6 +61,7 @@ pub fn chain_from_rules(rules: &[GuardrailRuleView<'_>]) -> Result<GuardChain, G
                         "regex_deny rule is missing the 'pattern' field".into(),
                     )
                 })?;
+
                 chain = chain.push(mode, Arc::new(RegexDenylistGuardrail::new([pat])?));
             }
             "json_schema" => {
@@ -67,7 +70,9 @@ pub fn chain_from_rules(rules: &[GuardrailRuleView<'_>]) -> Result<GuardChain, G
                         "json_schema rule is missing the 'schema' field".into(),
                     )
                 })?;
+
                 let label = rule.label.unwrap_or("json-schema");
+
                 chain = chain.push(
                     mode,
                     Arc::new(JsonSchemaGuardrail::new(label, schema.clone())?),
@@ -77,11 +82,13 @@ pub fn chain_from_rules(rules: &[GuardrailRuleView<'_>]) -> Result<GuardChain, G
                 let url = rule.url.ok_or_else(|| {
                     GuardError::SchemaValidation("webhook rule is missing the 'url' field".into())
                 })?;
+
                 let label = rule.label.unwrap_or("webhook");
+
                 chain = chain.push(mode, Arc::new(WebhookGuardrail::new(label, url)));
             }
             other => {
-                return Err(GuardError::RegexCompile(format!(
+                return Err(GuardError::InvalidConfig(format!(
                     "unknown guardrail type: '{other}'"
                 )));
             }
@@ -117,16 +124,20 @@ mod tests {
     #[tokio::test]
     async fn empty_rules_returns_empty_chain_that_allows_everything() {
         let chain = chain_from_rules(&[]).unwrap();
+
         let result = chain
             .run(&ctx("sk-ant-api03-FAKEFAKEFAKEFAKEFAKE is my key"))
             .await;
+
         assert_eq!(result.final_verdict, GuardVerdict::Allow);
     }
 
     #[tokio::test]
     async fn default_chain_blocks_secrets() {
         let chain = default_chain();
+
         let result = chain.run(&ctx("sk-ant-api03-FAKEFAKEFAKEFAKEFAKE")).await;
+
         assert!(matches!(result.final_verdict, GuardVerdict::Block { .. }));
     }
 
@@ -142,8 +153,11 @@ mod tests {
             url: None,
             stages: &[],
         }];
+
         let chain = chain_from_rules(&rules).unwrap();
+
         let result = chain.run(&ctx("sk-ant-api03-FAKEFAKEFAKEFAKEFAKE")).await;
+
         assert!(matches!(result.final_verdict, GuardVerdict::Block { .. }));
     }
 
@@ -159,9 +173,13 @@ mod tests {
             url: None,
             stages: &[],
         }];
+
         let chain = chain_from_rules(&rules).unwrap();
+
         let result = chain.run(&ctx("sk-ant-api03-FAKEFAKEFAKEFAKEFAKE")).await;
+
         assert_eq!(result.final_verdict, GuardVerdict::Allow);
+
         assert!(matches!(
             result.per_guardrail[0].2,
             GuardVerdict::Block { .. }
@@ -180,14 +198,18 @@ mod tests {
             url: None,
             stages: &[],
         }];
+
         let chain = chain_from_rules(&rules).unwrap();
+
         let result = chain.run(&ctx("email me at bob@example.com")).await;
+
         assert!(matches!(result.final_verdict, GuardVerdict::Mask { .. }));
     }
 
     #[tokio::test]
     async fn keyword_enforce_blocks_on_match() {
         let kws = vec!["forbidden".to_string()];
+
         let rules = [GuardrailRuleView {
             guardrail_type: "keyword",
             mode: "enforce",
@@ -198,8 +220,11 @@ mod tests {
             url: None,
             stages: &[],
         }];
+
         let chain = chain_from_rules(&rules).unwrap();
+
         let result = chain.run(&ctx("this is forbidden text")).await;
+
         assert!(matches!(result.final_verdict, GuardVerdict::Block { .. }));
     }
 
@@ -215,12 +240,14 @@ mod tests {
             url: None,
             stages: &[],
         }];
+
         assert!(chain_from_rules(&rules).is_err());
     }
 
     #[tokio::test]
     async fn regex_deny_enforce_blocks_on_match() {
         let pat = r"\bpassword\b".to_string();
+
         let rules = [GuardrailRuleView {
             guardrail_type: "regex_deny",
             mode: "enforce",
@@ -231,8 +258,11 @@ mod tests {
             url: None,
             stages: &[],
         }];
+
         let chain = chain_from_rules(&rules).unwrap();
+
         let result = chain.run(&ctx("reset my password please")).await;
+
         assert!(matches!(result.final_verdict, GuardVerdict::Block { .. }));
     }
 
@@ -248,6 +278,7 @@ mod tests {
             url: None,
             stages: &[],
         }];
+
         assert!(chain_from_rules(&rules).is_err());
     }
 
@@ -263,6 +294,7 @@ mod tests {
             url: None,
             stages: &[],
         }];
+
         assert!(chain_from_rules(&rules).is_err());
     }
 }
