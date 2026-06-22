@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod durable_store;
 pub mod export;
 pub mod headers;
 pub mod metrics;
@@ -21,6 +22,7 @@ pub mod row;
 pub mod sink;
 pub mod store;
 
+pub use durable_store::{DurableStoreError, SqliteSpendStore};
 pub use export::{ExportConfig, Exporter, NoopExporter, build_exporter};
 pub use headers::{
     CACHE_HEADER, COST_HEADER, FALLBACK_HEADER, OVERHEAD_HEADER, SERVED_BY_HEADER, cost_usd_string,

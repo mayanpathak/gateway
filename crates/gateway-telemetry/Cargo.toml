@@ -19,6 +19,9 @@ parking_lot = "0.12"
 prometheus-client = "0.22"
 subtle = "2"
 bytes = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
 opentelemetry = { version = "0.27", optional = true }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"], optional = true }
@@ -32,3 +35,6 @@ otel = [
     "dep:opentelemetry-otlp",
     "dep:opentelemetry-semantic-conventions",
 ]
+
+[dev-dependencies]
+tempfile = "3"
