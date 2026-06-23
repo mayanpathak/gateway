@@ -60,6 +60,11 @@ pub enum ProviderError {
     Upstream { status: u16, body: String },
     #[error("request feature unsupported by this provider: {feature}")]
     Unsupported { feature: String },
+    #[error("provider {provider} response appears to have schema drift: {reason}")]
+    SchemaDrift {
+        provider: &'static str,
+        reason: String,
+    },
     #[error("transport error: {0}")]
     Transport(String),
     #[error("failed to decode upstream response: {0}")]

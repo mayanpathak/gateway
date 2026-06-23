@@ -57,7 +57,9 @@ impl GatewayError {
                 }
                 ProviderError::Upstream { .. } => StatusCode::BAD_GATEWAY,
                 ProviderError::Unsupported { .. } => StatusCode::NOT_IMPLEMENTED,
-                ProviderError::Transport(_) | ProviderError::Decode(_) => StatusCode::BAD_GATEWAY,
+                ProviderError::SchemaDrift { .. }
+                | ProviderError::Transport(_)
+                | ProviderError::Decode(_) => StatusCode::BAD_GATEWAY,
             },
             GatewayError::BadRequest(_) => StatusCode::BAD_REQUEST,
             GatewayError::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,

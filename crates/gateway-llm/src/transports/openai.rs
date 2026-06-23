@@ -6,9 +6,12 @@
 //! billing). Streaming added in Task 10. Tool/structured-output FULL fidelity is
 //! P1.3; here tool defs/calls pass through their natural OpenAI shape.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use gateway_spine::TokenUsage;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::message::{ContentPart, ImageSource, Message, Role};
 use crate::provider::{Credentials, DeltaStream, Provider, ProviderCapabilities, ProviderError};
@@ -149,13 +152,39 @@ struct WireUsage {
     #[serde(default)]
     completion_tokens: i64,
     #[serde(default)]
+    total_tokens: Option<i64>,
+    #[serde(default)]
     prompt_tokens_details: Option<WirePromptDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<WireCompletionDetails>,
+    #[serde(flatten)]
+    unknown_fields: HashMap<String, Value>,
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct WirePromptDetails {
     #[serde(default)]
     cached_tokens: i64,
+    #[serde(default)]
+    audio_tokens: i64,
+    #[serde(flatten)]
+    unknown_fields: HashMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct WireCompletionDetails {
+    #[serde(default)]
+    reasoning_tokens: i64,
+    #[serde(default)]
+    audio_tokens: i64,
+    #[serde(default)]
+    accepted_prediction_tokens: i64,
+    #[serde(default)]
+    rejected_prediction_tokens: i64,
+    #[serde(flatten)]
+    unknown_fields: HashMap<String, Value>,
 }
 
 // ---- streaming wire structs ----
@@ -304,24 +333,78 @@ fn map_finish(reason: Option<&str>) -> FinishReason {
     }
 }
 
+fn usage_unknown_field_is_cost_critical(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("token") || key.contains("cache") || key.contains("usage")
+}
+
+fn openai_usage_drift_reason(u: &WireUsage) -> Option<String> {
+    let total = u
+        .total_tokens
+        .unwrap_or_else(|| u.prompt_tokens + u.completion_tokens);
+    if total > 0 && u.prompt_tokens == 0 && u.completion_tokens == 0 {
+        return Some(format!(
+            "usage total_tokens={total} but prompt_tokens=0 and completion_tokens=0"
+        ));
+    }
+
+    if let Some(key) = u
+        .unknown_fields
+        .keys()
+        .find(|key| usage_unknown_field_is_cost_critical(key))
+    {
+        return Some(format!("unknown cost-critical usage field `{key}`"));
+    }
+
+    if let Some(details) = &u.prompt_tokens_details
+        && let Some(key) = details
+            .unknown_fields
+            .keys()
+            .find(|key| usage_unknown_field_is_cost_critical(key))
+    {
+        return Some(format!(
+            "unknown cost-critical prompt_tokens_details field `{key}`"
+        ));
+    }
+
+    if let Some(details) = &u.completion_tokens_details
+        && let Some(key) = details
+            .unknown_fields
+            .keys()
+            .find(|key| usage_unknown_field_is_cost_critical(key))
+    {
+        return Some(format!(
+            "unknown cost-critical completion_tokens_details field `{key}`"
+        ));
+    }
+
+    None
+}
+
 /// OpenAI `prompt_tokens` INCLUDES cached; split into non-overlapping buckets.
-fn map_usage(u: Option<WireUsage>) -> TokenUsage {
+fn map_usage(u: Option<WireUsage>) -> Result<TokenUsage, ProviderError> {
     let Some(u) = u else {
-        return TokenUsage::default();
+        return Ok(TokenUsage::default());
     };
+    if let Some(reason) = openai_usage_drift_reason(&u) {
+        return Err(ProviderError::SchemaDrift {
+            provider: "openai",
+            reason,
+        });
+    }
     let cached = u
         .prompt_tokens_details
         .map(|d| d.cached_tokens)
         .unwrap_or(0);
-    TokenUsage {
+    Ok(TokenUsage {
         input_tokens: (u.prompt_tokens - cached).max(0),
         output_tokens: u.completion_tokens,
         cache_read_tokens: cached,
         cache_write_tokens: 0,
-    }
+    })
 }
 
-fn map_response(w: WireResponse) -> ChatResponse {
+fn map_response(w: WireResponse) -> Result<ChatResponse, ProviderError> {
     let choice = w.choices.into_iter().next();
     let (content, tool_calls, finish) = match choice {
         Some(c) => {
@@ -345,14 +428,14 @@ fn map_response(w: WireResponse) -> ChatResponse {
         }
         None => (Vec::new(), Vec::new(), FinishReason::Unknown),
     };
-    ChatResponse {
+    Ok(ChatResponse {
         model: w.model,
         content,
         tool_calls,
         finish_reason: finish,
-        usage: map_usage(w.usage),
+        usage: map_usage(w.usage)?,
         provider_response_id: w.id,
-    }
+    })
 }
 
 /// Parse one OpenAI stream `data:` payload into a unified delta. Returns `None`
@@ -386,7 +469,7 @@ fn parse_stream_chunk(payload: &str) -> Result<Option<crate::stream::StreamDelta
         }
     }
     if let Some(u) = chunk.usage {
-        delta.usage = Some(map_usage(Some(u)));
+        delta.usage = Some(map_usage(Some(u))?);
     }
     if delta.is_empty() {
         Ok(None)
@@ -465,7 +548,7 @@ impl Provider for OpenAi {
             .json()
             .await
             .map_err(|e| ProviderError::Decode(e.to_string()))?;
-        Ok(map_response(wire))
+        map_response(wire)
     }
 
     async fn stream(

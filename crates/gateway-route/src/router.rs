@@ -41,9 +41,10 @@ fn is_retryable(err: &ProviderError) -> bool {
         ProviderError::RateLimited { .. } => true,
         ProviderError::Transport(_) => true,
         ProviderError::Upstream { status, .. } => *status >= 500,
-        // Auth, Unsupported, Decode, and 4xx are terminal.
+        // Auth, Unsupported, SchemaDrift, Decode, and 4xx are terminal.
         ProviderError::Auth => false,
         ProviderError::Unsupported { .. } => false,
+        ProviderError::SchemaDrift { .. } => false,
         ProviderError::Decode(_) => false,
     }
 }

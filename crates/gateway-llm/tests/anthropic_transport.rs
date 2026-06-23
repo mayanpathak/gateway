@@ -5,7 +5,7 @@
 //! is direct.
 
 use gateway_llm::message::{Message, Role};
-use gateway_llm::provider::{Credentials, Provider};
+use gateway_llm::provider::{Credentials, Provider, ProviderError};
 use gateway_llm::req::ChatRequest;
 use gateway_llm::resp::FinishReason;
 use gateway_llm::transports::anthropic::Anthropic;
@@ -97,4 +97,85 @@ async fn anthropic_stream_accumulates_usage_and_text() {
     assert_eq!(u.input_tokens, 800);
     assert_eq!(u.cache_read_tokens, 200);
     assert_eq!(u.output_tokens, 2);
+}
+
+#[tokio::test]
+async fn anthropic_unknown_cache_usage_field_fails_closed() {
+    let server = MockServer::start().await;
+    let body = r#"{
+      "id": "msg_drift",
+      "type": "message",
+      "model": "claude-3-5-sonnet-20241022",
+      "stop_reason": "end_turn",
+      "content": [
+        { "type": "text", "text": "Hi" }
+      ],
+      "usage": {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_input_tokens": 10,
+        "cache_v2_input_tokens": 30
+      }
+    }"#;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let provider = Anthropic::new();
+    let creds = Credentials::new("sk-ant").with_base_url(server.uri());
+    let req = ChatRequest::new(
+        "claude-3-5-sonnet-20241022",
+        vec![Message::text(Role::User, "Hi")],
+    );
+
+    let err = provider
+        .chat(&req, &creds, "idem-ant-drift")
+        .await
+        .unwrap_err();
+    match err {
+        ProviderError::SchemaDrift { provider, reason } => {
+            assert_eq!(provider, "anthropic");
+            assert!(reason.contains("cache_v2_input_tokens"));
+        }
+        other => panic!("expected SchemaDrift, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn anthropic_unknown_non_usage_field_remains_permissive() {
+    let server = MockServer::start().await;
+    let body = r#"{
+      "id": "msg_extra",
+      "type": "message",
+      "model": "claude-3-5-sonnet-20241022",
+      "stop_reason": "end_turn",
+      "content": [
+        { "type": "text", "text": "Hi" }
+      ],
+      "usage": {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "billing_mode": "standard"
+      }
+    }"#;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let provider = Anthropic::new();
+    let creds = Credentials::new("sk-ant").with_base_url(server.uri());
+    let req = ChatRequest::new(
+        "claude-3-5-sonnet-20241022",
+        vec![Message::text(Role::User, "Hi")],
+    );
+
+    let resp = provider.chat(&req, &creds, "idem-ant-extra").await.unwrap();
+    assert_eq!(resp.usage.input_tokens, 100);
+    assert_eq!(resp.usage.output_tokens, 20);
 }

@@ -4,7 +4,7 @@
 //! non-overlapping TokenUsage (cached split out of prompt_tokens).
 
 use gateway_llm::message::{Message, Role};
-use gateway_llm::provider::{Credentials, Provider};
+use gateway_llm::provider::{Credentials, Provider, ProviderError};
 use gateway_llm::req::ChatRequest;
 use gateway_llm::resp::FinishReason;
 use gateway_llm::transports::openai::OpenAi;
@@ -87,4 +87,119 @@ async fn openai_stream_yields_text_deltas_then_usage() {
     assert_eq!(text, "Hello");
     assert_eq!(finish, Some(FinishReason::Stop));
     assert_eq!(usage.unwrap().output_tokens, 2);
+}
+
+#[tokio::test]
+async fn openai_usage_total_without_breakdown_fails_closed_as_schema_drift() {
+    let server = MockServer::start().await;
+    let body = r#"{
+      "id": "chatcmpl-drift",
+      "model": "gpt-4o",
+      "choices": [
+        {
+          "message": { "role": "assistant", "content": "Hello" },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "total_tokens": 1200,
+        "input_token_count": 1000,
+        "output_token_count": 200
+      }
+    }"#;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAi::new();
+    let creds = Credentials::new("sk-test").with_base_url(server.uri());
+    let req = ChatRequest::new("gpt-4o", vec![Message::text(Role::User, "Hi")]);
+
+    let err = provider.chat(&req, &creds, "idem-drift").await.unwrap_err();
+    match err {
+        ProviderError::SchemaDrift { provider, reason } => {
+            assert_eq!(provider, "openai");
+            assert!(reason.contains("total_tokens=1200"));
+        }
+        other => panic!("expected SchemaDrift, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn openai_unknown_cache_usage_field_fails_closed() {
+    let server = MockServer::start().await;
+    let body = r#"{
+      "id": "chatcmpl-cache-drift",
+      "model": "gpt-4o",
+      "choices": [
+        {
+          "message": { "role": "assistant", "content": "Hello" },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 1000,
+        "completion_tokens": 200,
+        "cache_details": { "cached_tokens": 800 }
+      }
+    }"#;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAi::new();
+    let creds = Credentials::new("sk-test").with_base_url(server.uri());
+    let req = ChatRequest::new("gpt-4o", vec![Message::text(Role::User, "Hi")]);
+
+    let err = provider
+        .chat(&req, &creds, "idem-cache-drift")
+        .await
+        .unwrap_err();
+    match err {
+        ProviderError::SchemaDrift { provider, reason } => {
+            assert_eq!(provider, "openai");
+            assert!(reason.contains("cache_details"));
+        }
+        other => panic!("expected SchemaDrift, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn openai_unknown_non_usage_field_remains_permissive() {
+    let server = MockServer::start().await;
+    let body = r#"{
+      "id": "chatcmpl-extra",
+      "model": "gpt-4o",
+      "choices": [
+        {
+          "message": { "role": "assistant", "content": "Hello" },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "service_tier": "default"
+      }
+    }"#;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAi::new();
+    let creds = Credentials::new("sk-test").with_base_url(server.uri());
+    let req = ChatRequest::new("gpt-4o", vec![Message::text(Role::User, "Hi")]);
+
+    let resp = provider.chat(&req, &creds, "idem-extra").await.unwrap();
+    assert_eq!(resp.usage.input_tokens, 10);
+    assert_eq!(resp.usage.output_tokens, 2);
 }

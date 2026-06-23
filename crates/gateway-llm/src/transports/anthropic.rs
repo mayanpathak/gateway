@@ -6,9 +6,12 @@
 //! tokens` is REQUIRED by Anthropic — we default it when unset. Streaming in
 //! Task 12; full tool/structured-output fidelity is P1.3.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use gateway_spine::TokenUsage;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::message::{ContentPart, Message, Role};
 use crate::provider::{Credentials, DeltaStream, Provider, ProviderCapabilities, ProviderError};
@@ -98,6 +101,8 @@ struct WireUsage {
     cache_read_input_tokens: i64,
     #[serde(default)]
     cache_creation_input_tokens: i64,
+    #[serde(flatten)]
+    unknown_fields: HashMap<String, Value>,
 }
 
 // ---- streaming wire structs ----
@@ -199,19 +204,34 @@ fn map_finish(reason: Option<&str>) -> FinishReason {
     }
 }
 
-fn map_usage(u: Option<WireUsage>) -> TokenUsage {
+fn usage_unknown_field_is_cost_critical(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("token") || key.contains("cache") || key.contains("usage")
+}
+
+fn map_usage(u: Option<WireUsage>) -> Result<TokenUsage, ProviderError> {
     let Some(u) = u else {
-        return TokenUsage::default();
+        return Ok(TokenUsage::default());
     };
-    TokenUsage {
+    if let Some(key) = u
+        .unknown_fields
+        .keys()
+        .find(|key| usage_unknown_field_is_cost_critical(key))
+    {
+        return Err(ProviderError::SchemaDrift {
+            provider: "anthropic",
+            reason: format!("unknown cost-critical usage field `{key}`"),
+        });
+    }
+    Ok(TokenUsage {
         input_tokens: u.input_tokens,
         output_tokens: u.output_tokens,
         cache_read_tokens: u.cache_read_input_tokens,
         cache_write_tokens: u.cache_creation_input_tokens,
-    }
+    })
 }
 
-fn map_response(w: WireResponse) -> ChatResponse {
+fn map_response(w: WireResponse) -> Result<ChatResponse, ProviderError> {
     let mut content = Vec::new();
     let mut tool_calls = Vec::new();
     for block in w.content {
@@ -225,14 +245,14 @@ fn map_response(w: WireResponse) -> ChatResponse {
             WireContentBlock::Other => {}
         }
     }
-    ChatResponse {
+    Ok(ChatResponse {
         model: w.model,
         content,
         tool_calls,
         finish_reason: map_finish(w.stop_reason.as_deref()),
-        usage: map_usage(w.usage),
+        usage: map_usage(w.usage)?,
         provider_response_id: w.id,
-    }
+    })
 }
 
 /// Fold one Anthropic stream event into (optional emitted delta, usage accumulator
@@ -247,7 +267,7 @@ fn fold_stream_event(
     match ev {
         WireStreamEvent::MessageStart { message } => {
             if let Some(u) = message.usage {
-                let mapped = map_usage(Some(u));
+                let mapped = map_usage(Some(u))?;
                 acc_usage.input_tokens = mapped.input_tokens;
                 acc_usage.cache_read_tokens = mapped.cache_read_tokens;
                 acc_usage.cache_write_tokens = mapped.cache_write_tokens;
@@ -357,7 +377,7 @@ impl Provider for Anthropic {
             .json()
             .await
             .map_err(|e| ProviderError::Decode(e.to_string()))?;
-        Ok(map_response(wire))
+        map_response(wire)
     }
 
     async fn stream(
